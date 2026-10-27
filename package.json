@@ -1,0 +1,10 @@
+{
+  "name": "gymopus-adms-server",
+  "version": "1.0.0",
+  "description": "ADMS Cloud Push Server for ESSL / ZKTeco Biometric Machines",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
