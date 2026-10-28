@@ -38,23 +38,28 @@ async function getGymMembers() {
   }
 
   try {
-    const membersUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/members?pageSize=300`;
-    const res = await fetch(membersUrl);
-    if (res.ok) {
+    let pageToken = "";
+    const allDocs = [];
+    do {
+      const membersUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/members?pageSize=300${pageToken ? `&pageToken=${pageToken}` : ""}`;
+      const res = await fetch(membersUrl);
+      if (!res.ok) break;
       const json = await res.json();
-      const docs = json.documents || [];
-      cachedMembers = docs.map((doc) => {
-        const docId = doc.name.split("/").pop();
-        const f = doc.fields || {};
-        return {
-          id: docId,
-          biometricId: f.biometricId?.stringValue || "",
-          memberCode: f.memberCode?.stringValue || "",
-          name: f.name?.stringValue || f.fullName?.stringValue || `Member #${docId}`,
-        };
-      });
-      lastMembersFetchTime = now;
-    }
+      if (json.documents) allDocs.push(...json.documents);
+      pageToken = json.nextPageToken || "";
+    } while (pageToken);
+
+    cachedMembers = allDocs.map((doc) => {
+      const docId = doc.name.split("/").pop();
+      const f = doc.fields || {};
+      return {
+        id: docId,
+        biometricId: f.biometricId?.stringValue || "",
+        memberCode: f.memberCode?.stringValue || "",
+        name: f.name?.stringValue || f.fullName?.stringValue || `Member #${docId}`,
+      };
+    });
+    lastMembersFetchTime = now;
   } catch (err) {
     console.warn("[MEMBER CACHE] Failed to fetch members:", err.message);
   }
