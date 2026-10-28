@@ -3,7 +3,7 @@
  *
  * Implements the standard ZKTeco ADMS (Automatic Data Master Server) Push Protocol:
  * - GET  /iclock/cdata       -> Handshake with machine (device options & config)
- * - POST /iclock/cdata       -> Receives attendance punch logs (table=ATTLOG with dedup & member filter)
+ * - POST /iclock/cdata       -> Receives attendance punch logs (with 60s member cache & dedup)
  * - GET  /iclock/getrequest  -> Heartbeat & command polling (dispatches ENROLL_FP / DATA USER)
  * - POST /iclock/devicecmd   -> Confirms fingerprint capture ONLY on ENROLL_FP completion
  * - POST /api/enroll         -> API for web app to queue remote fingerprint enrollment
@@ -27,15 +27,45 @@ console.log("=".repeat(60));
 let commandCounter = 100;
 const commandRegistry = new Map(); // id -> { docId, memberId, pin, name, type: "USER"|"ENROLL" }
 
-// In-memory cache to prevent duplicate punches within the same minute
+// In-memory cache for gym members (refreshed every 60s to handle 1000s of ATTLOG lines instantly)
+let cachedMembers = [];
+let lastMembersFetchTime = 0;
+
+async function getGymMembers() {
+  const now = Date.now();
+  if (cachedMembers.length > 0 && now - lastMembersFetchTime < 60 * 1000) {
+    return cachedMembers;
+  }
+
+  try {
+    const membersUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/members?pageSize=300`;
+    const res = await fetch(membersUrl);
+    if (res.ok) {
+      const json = await res.json();
+      const docs = json.documents || [];
+      cachedMembers = docs.map((doc) => {
+        const docId = doc.name.split("/").pop();
+        const f = doc.fields || {};
+        return {
+          id: docId,
+          biometricId: f.biometricId?.stringValue || "",
+          memberCode: f.memberCode?.stringValue || "",
+          name: f.name?.stringValue || f.fullName?.stringValue || `Member #${docId}`,
+        };
+      });
+      lastMembersFetchTime = now;
+    }
+  } catch (err) {
+    console.warn("[MEMBER CACHE] Failed to fetch members:", err.message);
+  }
+  return cachedMembers;
+}
+
+// In-memory set for deduplicating punches within the same session
 const seenPunches = new Set();
 
 /**
- * Push an attendance punch directly to Firebase Firestore via REST API
- * Includes:
- * 1. Filter: Only records attendance if the PIN belongs to a registered gym member
- * 2. Deduplication: Prevents double entries for the same punch time
- * 3. Buffer Protection: Prevents flooding Firestore with old historical punches
+ * Record attendance punch with member lookup & deduplication
  */
 async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
   try {
@@ -62,52 +92,36 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
     // Deduplication check
     const punchKey = `${userId}_${formattedDate}_${formattedTime}`;
     if (seenPunches.has(punchKey)) {
-      console.log(`[ATTENDANCE DEDUP] Skipping duplicate punch for UID ${userId} at ${formattedTime}`);
       return false;
     }
 
-    // 1. Check if user is a registered member in members collection
-    let memberName = null;
-    let memberId = null;
+    // Fast O(1) in-memory lookup against cached members
+    const members = await getGymMembers();
+    const matched = members.find((m) => {
+      const cleanCode = m.memberCode.replace(/\D/g, "");
+      return (
+        String(userId) === m.id ||
+        String(userId) === m.biometricId ||
+        String(userId) === m.memberCode ||
+        (cleanCode && cleanCode === String(userId))
+      );
+    });
 
-    try {
-      const membersUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/members`;
-      const res = await fetch(membersUrl);
-      if (res.ok) {
-        const json = await res.json();
-        const docs = json.documents || [];
-        for (const doc of docs) {
-          const docId = doc.name.split("/").pop();
-          const f = doc.fields || {};
-          const bId = f.biometricId?.stringValue || "";
-          const mCode = f.memberCode?.stringValue || "";
-          const name = f.name?.stringValue || f.fullName?.stringValue || "";
-
-          // Match by biometric PIN, member code, or document ID
-          if (
-            String(userId) === docId ||
-            String(userId) === bId ||
-            String(userId) === mCode ||
-            mCode.replace(/\D/g, "") === String(userId)
-          ) {
-            memberName = name || `Member #${userId}`;
-            memberId = docId;
-            break;
-          }
-        }
-      }
-    } catch (e) {
-      console.warn("Member lookup note:", e.message);
-    }
-
-    // If user is unknown (e.g. leftover punch from an old system), skip to prevent buffer flood
-    if (!memberId) {
+    // Skip unknown PINs (protects against old historical buffer upload from previous software)
+    if (!matched) {
       console.log(`[ATTENDANCE SKIP] Unknown PIN ${userId} on device ${sn}. Ignoring to protect database.`);
       return false;
     }
 
-    // 2. Post attendance record to Firestore
-    const attUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/attendance`;
+    const memberId = matched.id;
+    const memberName = matched.name;
+
+    // Use a deterministic document ID to prevent duplicate records in Firestore even across server restarts
+    const cleanDate = formattedDate.replace(/[^a-zA-Z0-9]/g, "");
+    const cleanTime = formattedTime.replace(/[^a-zA-Z0-9]/g, "");
+    const customDocId = `att_${memberId}_${cleanDate}_${cleanTime}`;
+
+    const attUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/attendance?documentId=${customDocId}`;
     const payload = {
       fields: {
         member_id: { stringValue: memberId },
@@ -137,18 +151,23 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
       body: JSON.stringify(payload),
     });
 
-    if (postRes.ok) {
-      seenPunches.add(punchKey);
-      // Keep cache size bounded
-      if (seenPunches.size > 2000) {
-        const first = seenPunches.values().next().value;
-        seenPunches.delete(first);
-      }
+    // Even if 409 Conflict occurs (already recorded), treat as success deduplication
+    seenPunches.add(punchKey);
+    if (seenPunches.size > 2000) {
+      const first = seenPunches.values().next().value;
+      seenPunches.delete(first);
+    }
 
+    if (postRes.ok) {
       console.log(`[ATTENDANCE] Recorded: ${memberName} (UID: ${userId}) at ${formattedDate} ${formattedTime}`);
       return true;
     } else {
-      console.error("[ATTENDANCE] Failed to save:", await postRes.text());
+      const errText = await postRes.text();
+      if (errText.includes("ALREADY_EXISTS") || postRes.status === 409) {
+        console.log(`[ATTENDANCE DEDUP] Already exists in Firestore for ${memberName} at ${formattedTime}`);
+        return true;
+      }
+      console.error("[ATTENDANCE] Failed to save:", errText);
       return false;
     }
   } catch (err) {
@@ -241,6 +260,9 @@ async function updateMemberBiometricRegistered(memberId, pin) {
 
     if (res.ok) {
       console.log(`[MEMBER ENROLLED] Member ${memberId} successfully marked enrolled with PIN ${pin}!`);
+      // Invalidate member cache so subsequent punches recognize the new biometric PIN
+      cachedMembers = [];
+      lastMembersFetchTime = 0;
     }
   } catch (err) {
     console.warn(`[MEMBER ENROLLED] Failed to update member ${memberId}:`, err.message);
@@ -365,6 +387,7 @@ const server = http.createServer((req, res) => {
         const lines = body.trim().split(/\r?\n/);
         let count = 0;
 
+        // Process all punches with fast in-memory member lookup
         for (const line of lines) {
           if (!line.trim()) continue;
           const cols = line.split("\t");
@@ -452,8 +475,17 @@ const server = http.createServer((req, res) => {
 
       const params = new URLSearchParams(body.trim());
       const cmdId = params.get("ID");
-      const ret = params.get("Return");
+      const ret = params.get("Return") || "";
       const cmdName = params.get("CMD") || "";
+
+      // Check success conditions: numeric >= 0 or "OK"
+      const isSuccess =
+        ret === "0" ||
+        ret === "1" ||
+        parseInt(ret, 10) >= 0 ||
+        ret.toUpperCase() === "OK" ||
+        body.includes("Return=0") ||
+        body.includes("Return=OK");
 
       if (cmdId && commandRegistry.has(cmdId)) {
         const reg = commandRegistry.get(cmdId);
@@ -464,7 +496,7 @@ const server = http.createServer((req, res) => {
           commandRegistry.delete(cmdId);
         } else if (reg.type === "ENROLL") {
           // Physical fingerprint sensor completed 3 scans!
-          if (ret === "0" || ret === "1" || parseInt(ret, 10) >= 0) {
+          if (isSuccess) {
             console.log(`[ENROLLMENT SUCCESS] Fingerprint captured on machine for PIN ${reg.pin}!`);
             await updateCommandStatusInFirestore(reg.docId, "completed", {
               completedAt: new Date().toISOString(),
@@ -477,8 +509,8 @@ const server = http.createServer((req, res) => {
           commandRegistry.delete(cmdId);
         }
       } else {
-        // Fallback: check if body explicitly contains Return=0 for ENROLL_FP
-        if (body.includes("ENROLL_FP") && (body.includes("Return=0") || body.includes("Return=OK"))) {
+        // Fallback: if body explicitly contains ENROLL_FP success, find any pending ENROLL in registry or Firestore
+        if ((body.includes("ENROLL_FP") || cmdName === "ENROLL_FP") && isSuccess) {
           for (const [id, reg] of commandRegistry.entries()) {
             if (reg.type === "ENROLL") {
               await updateCommandStatusInFirestore(reg.docId, "completed", {
