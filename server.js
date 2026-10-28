@@ -274,12 +274,22 @@ async function updateMemberBiometricRegistered(memberId, pin) {
   }
 }
 
+const activeDevices = {};
+
 /**
  * Update or auto-register device heartbeat in Firestore
  */
 async function updateDeviceHeartbeat(sn) {
   try {
     if (!sn) return;
+    const nowIso = new Date().toISOString();
+    const nowStr = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    activeDevices[sn] = {
+      lastSeenIso: nowIso,
+      lastHeartbeat: nowStr,
+      status: "online",
+    };
+
     const devUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/biometric_devices`;
     const res = await fetch(devUrl);
     if (!res.ok) return;
@@ -291,16 +301,16 @@ async function updateDeviceHeartbeat(sn) {
       return s === sn || docId === sn;
     });
 
-    const nowStr = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
     if (match) {
       const docPath = match.name;
-      await fetch(`https://firestore.googleapis.com/v1/${docPath}?updateMask.fieldPaths=lastHeartbeat&updateMask.fieldPaths=status`, {
+      await fetch(`https://firestore.googleapis.com/v1/${docPath}?updateMask.fieldPaths=lastHeartbeat&updateMask.fieldPaths=lastSeenIso&updateMask.fieldPaths=status`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           fields: {
             status: { stringValue: "online" },
             lastHeartbeat: { stringValue: nowStr },
+            lastSeenIso: { stringValue: nowIso },
           },
         }),
       });
@@ -318,7 +328,8 @@ async function updateDeviceHeartbeat(sn) {
             location: { stringValue: "Gym Entrance" },
             status: { stringValue: "online" },
             lastHeartbeat: { stringValue: nowStr },
-            createdAt: { stringValue: new Date().toISOString() },
+            lastSeenIso: { stringValue: nowIso },
+            createdAt: { stringValue: nowIso },
           },
         }),
       });
@@ -385,6 +396,7 @@ const server = http.createServer((req, res) => {
     });
 
     req.on("end", async () => {
+      if (sn) updateDeviceHeartbeat(sn);
       const table = (query.table || "").toString().toUpperCase();
       console.log(`[DATA UPLOAD] Table: ${table}, Body length: ${body.length}`);
 
@@ -595,6 +607,7 @@ const server = http.createServer((req, res) => {
         timestamp: new Date().toISOString(),
         supportedTables: ["ATTLOG", "OPERLOG"],
         supportedCommands: ["DATA USER", "ENROLL_FP"],
+        activeDevices: activeDevices,
       })
     );
     return;
