@@ -75,13 +75,19 @@ const seenPunches = new Set();
 async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
   try {
     const parts = timestamp.split(" ");
-    const dateParts = (parts[0] || "").split("-"); // YYYY-MM-DD
+    const dateParts = (parts[0] || "").split(/[-/]/); // Handles YYYY-MM-DD, DD/MM/YYYY, etc.
     const timeParts = (parts[1] || "").split(":"); // HH:MM:SS
 
-    // Convert date to dd-MM-yyyy format standard in GymOpus
+    // Convert date to standard dd-MM-yyyy format
     let formattedDate = parts[0] || "";
     if (dateParts.length === 3) {
-      formattedDate = `${dateParts[2].padStart(2, "0")}-${dateParts[1].padStart(2, "0")}-${dateParts[0]}`;
+      if (dateParts[0].length === 4) {
+        // YYYY-MM-DD -> DD-MM-YYYY
+        formattedDate = `${dateParts[2].padStart(2, "0")}-${dateParts[1].padStart(2, "0")}-${dateParts[0]}`;
+      } else {
+        // DD-MM-YYYY
+        formattedDate = `${dateParts[0].padStart(2, "0")}-${dateParts[1].padStart(2, "0")}-${dateParts[2]}`;
+      }
     }
 
     // Convert time to 12-hour AM/PM format
@@ -112,14 +118,28 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
       );
     });
 
-    // Skip unknown PINs (protects against old historical buffer upload from previous software)
-    if (!matched) {
-      console.log(`[ATTENDANCE SKIP] Unknown PIN ${userId} on device ${sn}. Ignoring to protect database.`);
+    // Check if punch is from today (IST / local date)
+    const todayStr = new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }).replace(/\//g, "-");
+    const todayParts = todayStr.split("-"); // [DD, MM, YYYY] or similar
+    const todayFormatted = `${(todayParts[0] || "").padStart(2, "0")}-${(todayParts[1] || "").padStart(2, "0")}-${todayParts[2]}`;
+    const isToday = formattedDate === todayFormatted || parts[0] === new Date().toISOString().split("T")[0];
+
+    let memberId = "";
+    let memberName = "";
+
+    if (matched) {
+      memberId = matched.id;
+      memberName = matched.name;
+    } else if (isToday) {
+      // Live demo punch! Allow today's live test even if PIN is not yet mapped to a named member
+      console.log(`[ATTENDANCE LIVE] Today's punch for unassigned PIN ${userId} on device ${sn}. Recording live!`);
+      memberId = `pin_${userId}`;
+      memberName = `Biometric PIN #${userId} (Unassigned)`;
+    } else {
+      // Historical buffer upload from old days - skip to avoid database pollution
+      console.log(`[ATTENDANCE SKIP] Historical buffer PIN ${userId} date ${formattedDate} on device ${sn}. Skipping.`);
       return false;
     }
-
-    const memberId = matched.id;
-    const memberName = matched.name;
 
     // Use a deterministic document ID to prevent duplicate records in Firestore even across server restarts
     const cleanDate = formattedDate.replace(/[^a-zA-Z0-9]/g, "");
@@ -407,7 +427,13 @@ const server = http.createServer((req, res) => {
         // Process all punches with fast in-memory member lookup
         for (const line of lines) {
           if (!line.trim()) continue;
-          const cols = line.split("\t");
+          let cols = line.split("\t");
+          if (cols.length < 2) {
+            const spaceCols = line.trim().split(/\s+/);
+            if (spaceCols.length >= 3) {
+              cols = [spaceCols[0], `${spaceCols[1]} ${spaceCols[2]}`];
+            }
+          }
           const userId = (cols[0] || "").trim();
           const punchTime = (cols[1] || "").trim();
 
@@ -417,7 +443,8 @@ const server = http.createServer((req, res) => {
           }
         }
 
-        const reply = `OK: ${count}\n`;
+        // Return number of parsed lines so machine flushes transmit buffer
+        const reply = `OK: ${lines.length}\n`;
         res.writeHead(200, {
           "Content-Type": "text/plain",
           "Content-Length": Buffer.byteLength(reply),
