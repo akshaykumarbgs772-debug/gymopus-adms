@@ -3,9 +3,9 @@
  *
  * Implements the standard ZKTeco ADMS (Automatic Data Master Server) Push Protocol:
  * - GET  /iclock/cdata       -> Handshake with machine (device options & config)
- * - POST /iclock/cdata       -> Receives attendance punch logs (table=ATTLOG)
+ * - POST /iclock/cdata       -> Receives attendance punch logs (table=ATTLOG with dedup & member filter)
  * - GET  /iclock/getrequest  -> Heartbeat & command polling (dispatches ENROLL_FP / DATA USER)
- * - POST /iclock/devicecmd   -> Device command execution confirmation
+ * - POST /iclock/devicecmd   -> Confirms fingerprint capture ONLY on ENROLL_FP completion
  * - POST /api/enroll         -> API for web app to queue remote fingerprint enrollment
  *
  * Saves attendance and biometrics directly into Firebase Firestore `prakash-dry-clean`.
@@ -25,10 +25,17 @@ console.log("=".repeat(60));
 
 // In-memory registry for pending device commands
 let commandCounter = 100;
-const commandRegistry = new Map(); // id -> { docId, memberId, pin, name, type }
+const commandRegistry = new Map(); // id -> { docId, memberId, pin, name, type: "USER"|"ENROLL" }
+
+// In-memory cache to prevent duplicate punches within the same minute
+const seenPunches = new Set();
 
 /**
  * Push an attendance punch directly to Firebase Firestore via REST API
+ * Includes:
+ * 1. Filter: Only records attendance if the PIN belongs to a registered gym member
+ * 2. Deduplication: Prevents double entries for the same punch time
+ * 3. Buffer Protection: Prevents flooding Firestore with old historical punches
  */
 async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
   try {
@@ -52,9 +59,16 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
       formattedTime = `${String(hours).padStart(2, "0")}:${minutes} ${ampm}`;
     }
 
-    // 1. Try to find member name from members collection
-    let memberName = `Member #${userId}`;
-    let memberId = String(userId);
+    // Deduplication check
+    const punchKey = `${userId}_${formattedDate}_${formattedTime}`;
+    if (seenPunches.has(punchKey)) {
+      console.log(`[ATTENDANCE DEDUP] Skipping duplicate punch for UID ${userId} at ${formattedTime}`);
+      return false;
+    }
+
+    // 1. Check if user is a registered member in members collection
+    let memberName = null;
+    let memberId = null;
 
     try {
       const membersUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/members`;
@@ -69,8 +83,14 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
           const mCode = f.memberCode?.stringValue || "";
           const name = f.name?.stringValue || f.fullName?.stringValue || "";
 
-          if (String(userId) === docId || String(userId) === bId || String(userId) === mCode) {
-            memberName = name || memberName;
+          // Match by biometric PIN, member code, or document ID
+          if (
+            String(userId) === docId ||
+            String(userId) === bId ||
+            String(userId) === mCode ||
+            mCode.replace(/\D/g, "") === String(userId)
+          ) {
+            memberName = name || `Member #${userId}`;
             memberId = docId;
             break;
           }
@@ -78,6 +98,12 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
       }
     } catch (e) {
       console.warn("Member lookup note:", e.message);
+    }
+
+    // If user is unknown (e.g. leftover punch from an old system), skip to prevent buffer flood
+    if (!memberId) {
+      console.log(`[ATTENDANCE SKIP] Unknown PIN ${userId} on device ${sn}. Ignoring to protect database.`);
+      return false;
     }
 
     // 2. Post attendance record to Firestore
@@ -112,6 +138,13 @@ async function recordAttendanceToFirestore({ userId, timestamp, sn }) {
     });
 
     if (postRes.ok) {
+      seenPunches.add(punchKey);
+      // Keep cache size bounded
+      if (seenPunches.size > 2000) {
+        const first = seenPunches.values().next().value;
+        seenPunches.delete(first);
+      }
+
       console.log(`[ATTENDANCE] Recorded: ${memberName} (UID: ${userId}) at ${formattedDate} ${formattedTime}`);
       return true;
     } else {
@@ -215,16 +248,21 @@ async function updateMemberBiometricRegistered(memberId, pin) {
 }
 
 /**
- * Update device heartbeat in Firestore
+ * Update or auto-register device heartbeat in Firestore
  */
 async function updateDeviceHeartbeat(sn) {
   try {
+    if (!sn) return;
     const devUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/biometric_devices`;
     const res = await fetch(devUrl);
     if (!res.ok) return;
     const json = await res.json();
     const docs = json.documents || [];
-    const match = docs.find((d) => d.fields?.serialNumber?.stringValue === sn);
+    const match = docs.find((d) => {
+      const s = d.fields?.serialNumber?.stringValue || "";
+      const docId = d.name.split("/").pop();
+      return s === sn || docId === sn;
+    });
 
     const nowStr = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
     if (match) {
@@ -239,9 +277,28 @@ async function updateDeviceHeartbeat(sn) {
           },
         }),
       });
+    } else {
+      // Auto-upsert device if not yet in database
+      await fetch(`${devUrl}?documentId=${sn}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fields: {
+            serialNumber: { stringValue: sn },
+            deviceName: { stringValue: "The Rock Gym Teghra (Biometric)" },
+            model: { stringValue: "eSSL ZLM60 / K90 Pro" },
+            branchName: { stringValue: "The Rock Gym Teghra" },
+            location: { stringValue: "Gym Entrance" },
+            status: { stringValue: "online" },
+            lastHeartbeat: { stringValue: nowStr },
+            createdAt: { stringValue: new Date().toISOString() },
+          },
+        }),
+      });
+      console.log(`[DEVICE REGISTERED] Auto-registered device ${sn} in biometric_devices!`);
     }
-  } catch {
-    // quiet heartbeat
+  } catch (err) {
+    console.warn("[HEARTBEAT] Error:", err.message);
   }
 }
 
@@ -315,8 +372,8 @@ const server = http.createServer((req, res) => {
           const punchTime = (cols[1] || "").trim();
 
           if (userId && punchTime) {
-            await recordAttendanceToFirestore({ userId, timestamp: punchTime, sn });
-            count++;
+            const recorded = await recordAttendanceToFirestore({ userId, timestamp: punchTime, sn });
+            if (recorded) count++;
           }
         }
 
@@ -349,7 +406,9 @@ const server = http.createServer((req, res) => {
         const cmdId1 = ++commandCounter;
         const cmdId2 = ++commandCounter;
 
+        // cmdId1: create user in memory
         commandRegistry.set(String(cmdId1), { ...cmd, type: "USER" });
+        // cmdId2: activate fingerprint sensor on machine
         commandRegistry.set(String(cmdId2), { ...cmd, type: "ENROLL" });
 
         // Build ZKTeco ADMS command response:
@@ -381,6 +440,7 @@ const server = http.createServer((req, res) => {
   }
 
   // 4. Device Command Execution Result: POST /iclock/devicecmd
+  // CRITICAL FIX: Only complete command when ENROLL_FP (actual fingerprint scan) succeeds!
   if (req.method === "POST" && pathname === "/iclock/devicecmd") {
     let body = "";
     req.on("data", (chunk) => {
@@ -390,7 +450,6 @@ const server = http.createServer((req, res) => {
     req.on("end", async () => {
       console.log(`[DEVICE CMD RESULT] Device ${sn} replied:`, body.trim());
 
-      // Parse ID=102&Return=0&CMD=ENROLL_FP format
       const params = new URLSearchParams(body.trim());
       const cmdId = params.get("ID");
       const ret = params.get("Return");
@@ -398,27 +457,37 @@ const server = http.createServer((req, res) => {
 
       if (cmdId && commandRegistry.has(cmdId)) {
         const reg = commandRegistry.get(cmdId);
-        if (ret === "0" || ret === "1" || parseInt(ret, 10) >= 0) {
-          console.log(`[COMMAND COMPLETE] Success for PIN ${reg.pin}!`);
-          await updateCommandStatusInFirestore(reg.docId, "completed", {
-            completedAt: new Date().toISOString(),
-          });
-          await updateMemberBiometricRegistered(reg.memberId, reg.pin);
-        } else {
-          console.warn(`[COMMAND FAILED] Device reported code ${ret} for PIN ${reg.pin}`);
-          await updateCommandStatusInFirestore(reg.docId, "failed");
-        }
-      } else {
-        // Fallback: check if body contains "Return=0"
-        if (body.includes("Return=0") || body.includes("Return=OK")) {
-          // Find any dispatched command and complete it
-          for (const [id, reg] of commandRegistry.entries()) {
+
+        if (reg.type === "USER") {
+          // User created in device memory -> DO NOT mark complete yet, waiting for finger scan!
+          console.log(`[USER SYNCED ON DEVICE] PIN ${reg.pin} created in device memory.`);
+          commandRegistry.delete(cmdId);
+        } else if (reg.type === "ENROLL") {
+          // Physical fingerprint sensor completed 3 scans!
+          if (ret === "0" || ret === "1" || parseInt(ret, 10) >= 0) {
+            console.log(`[ENROLLMENT SUCCESS] Fingerprint captured on machine for PIN ${reg.pin}!`);
             await updateCommandStatusInFirestore(reg.docId, "completed", {
               completedAt: new Date().toISOString(),
             });
             await updateMemberBiometricRegistered(reg.memberId, reg.pin);
-            commandRegistry.delete(id);
-            break;
+          } else {
+            console.warn(`[ENROLLMENT FAILED / CANCELLED] Device reported code ${ret} for PIN ${reg.pin}`);
+            await updateCommandStatusInFirestore(reg.docId, "failed");
+          }
+          commandRegistry.delete(cmdId);
+        }
+      } else {
+        // Fallback: check if body explicitly contains Return=0 for ENROLL_FP
+        if (body.includes("ENROLL_FP") && (body.includes("Return=0") || body.includes("Return=OK"))) {
+          for (const [id, reg] of commandRegistry.entries()) {
+            if (reg.type === "ENROLL") {
+              await updateCommandStatusInFirestore(reg.docId, "completed", {
+                completedAt: new Date().toISOString(),
+              });
+              await updateMemberBiometricRegistered(reg.memberId, reg.pin);
+              commandRegistry.delete(id);
+              break;
+            }
           }
         }
       }
