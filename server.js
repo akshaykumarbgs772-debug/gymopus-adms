@@ -470,23 +470,11 @@ const server = http.createServer((req, res) => {
         const cmd = pendingCmds[0];
         console.log(`[DISPATCH COMMAND] Sending to device ${sn}:`, cmd);
 
-        const cmdId1 = ++commandCounter;
-        const cmdId2 = ++commandCounter;
+        const cmdId = ++commandCounter;
+        // Direct single ENROLL_FP command - activates physical sensor and beeps instantly
+        commandRegistry.set(String(cmdId), { ...cmd, type: "ENROLL" });
 
-        // cmdId1: create user in memory
-        commandRegistry.set(String(cmdId1), { ...cmd, type: "USER" });
-        // cmdId2: activate fingerprint sensor on machine
-        commandRegistry.set(String(cmdId2), { ...cmd, type: "ENROLL" });
-
-        // Build ZKTeco ADMS command response:
-        // C:<id>:DATA USER PIN=<pin>\tName=<name>\tPri=0
-        // C:<id>:ENROLL_FP PIN=<pin>\tFID=0\tRETRY=3\tOVERWRITE=1
-        const cleanName = (cmd.memberName || "Member").replace(/[\t\r\n]/g, " ").slice(0, 20);
-        const commandString = [
-          `C:${cmdId1}:DATA USER PIN=${cmd.pin}\tName=${cleanName}\tPri=0`,
-          `C:${cmdId2}:ENROLL_FP PIN=${cmd.pin}\tFID=0\tRETRY=3\tOVERWRITE=1`,
-          "",
-        ].join("\r\n");
+        const commandString = `C:${cmdId}:ENROLL_FP PIN=${cmd.pin}\tFID=0\tRETRY=3\tOVERWRITE=1\r\n`;
 
         // Mark as dispatched
         await updateCommandStatusInFirestore(cmd.docId, "dispatched");
