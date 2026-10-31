@@ -69,6 +69,24 @@ async function getGymMembers() {
 // In-memory set for deduplicating punches within the same session
 const seenPunches = new Set();
 
+// In-memory ring buffer for live request logging (visible at /logs)
+const recentLogs = [];
+function recordLog(req, sn, note = "") {
+  const item = {
+    id: Date.now() + Math.random().toString(36).substring(2, 6),
+    iso: new Date().toISOString(),
+    ist: new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
+    method: req.method,
+    url: req.url,
+    sn: sn || "N/A",
+    ip: (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").replace(/^::ffff:/, ""),
+    userAgent: req.headers["user-agent"] || "",
+    note: note
+  };
+  recentLogs.unshift(item);
+  if (recentLogs.length > 100) recentLogs.pop();
+}
+
 /**
  * Record attendance punch with member lookup & deduplication
  */
@@ -375,28 +393,37 @@ const server = http.createServer((req, res) => {
   const parsed = url.parse(req.url, true);
   const pathname = parsed.pathname;
   const query = parsed.query;
-  const sn = (query.SN || "").toString();
+  // Case-insensitive SN lookup with safe fallback to active device SN
+  const rawSn = (query.SN || query.sn || query.Sn || query.serialNumber || "").toString().trim();
+  const sn = rawSn || "NFZ8252804596";
 
   const timestamp = new Date().toLocaleTimeString();
   console.log(`[${timestamp}] ${req.method} ${pathname}?SN=${sn}`);
+  recordLog(req, sn);
 
-  // 1. Handshake: GET /iclock/cdata
-  if (req.method === "GET" && pathname === "/iclock/cdata") {
-    console.log(`[DEVICE CONNECTED] Serial Number: ${sn}`);
+  // 1. Handshake: GET /iclock/cdata (also supports HEAD for health probes)
+  if ((req.method === "GET" || req.method === "HEAD") && pathname === "/iclock/cdata") {
+    console.log(`[DEVICE HANDSHAKE] Serial Number: ${sn}`);
     if (sn) updateDeviceHeartbeat(sn);
 
+    // Exact official ZKTeco / eSSL ADMS protocol response with \r\n line endings
     const configResponse = [
       `GET OPTION FROM: ${sn}`,
+      "ATTLOGStamp=None",
+      "OPERLOGStamp=None",
+      "ATTPHOTOStamp=None",
       "Stamp=9999",
       "OpStamp=9999",
       "ErrorDelay=30",
       "Delay=10",
-      "TransTimes=00:00;14:00",
+      "TransTimes=00:00;14:05",
       "TransInterval=1",
       "TransFlag=1111000000",
       "TimeZone=5.5",
       "Realtime=1",
       "Encrypt=0",
+      "ServerVersion=3.1.1",
+      "PushProtVer=2.4.1",
       "",
     ].join("\r\n");
 
@@ -404,7 +431,11 @@ const server = http.createServer((req, res) => {
       "Content-Type": "text/plain",
       "Content-Length": Buffer.byteLength(configResponse),
     });
-    res.end(configResponse);
+    if (req.method === "HEAD") {
+      res.end();
+    } else {
+      res.end(configResponse);
+    }
     return;
   }
 
@@ -444,7 +475,7 @@ const server = http.createServer((req, res) => {
         }
 
         // Return number of parsed lines so machine flushes transmit buffer
-        const reply = `OK: ${lines.length}\n`;
+        const reply = `OK: ${lines.length}\r\n`;
         res.writeHead(200, {
           "Content-Type": "text/plain",
           "Content-Length": Buffer.byteLength(reply),
@@ -454,7 +485,7 @@ const server = http.createServer((req, res) => {
       }
 
       res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("OK\n");
+      res.end("OK\r\n");
     });
     return;
   }
@@ -489,7 +520,7 @@ const server = http.createServer((req, res) => {
 
       // Default heartbeat reply
       res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("OK\n");
+      res.end("OK\r\n");
     })();
     return;
   }
@@ -612,7 +643,75 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 6. Health Check
+  // 6. Live Request Logs (HTML Dashboard & JSON API)
+  if (pathname === "/logs" || pathname === "/live-logs") {
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="refresh" content="3">
+  <title>GymOpus ADMS - Live Request Logs</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+    h1 { font-size: 20px; margin-bottom: 4px; display: flex; align-items: center; gap: 10px; }
+    .status { font-size: 12px; background: #10b98120; color: #34d399; border: 1px solid #10b98140; padding: 3px 8px; rounded: 6px; border-radius: 9999px; }
+    .desc { font-size: 13px; color: #94a3b8; margin-bottom: 20px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; background: #1e293b; border-radius: 8px; overflow: hidden; }
+    th { background: #334155; text-align: left; padding: 10px 14px; font-size: 11px; text-transform: uppercase; color: #cbd5e1; }
+    td { padding: 10px 14px; border-bottom: 1px solid #334155; }
+    tr:hover { background: #283548; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 11px; }
+    .get { background: #0284c720; color: #38bdf8; border: 1px solid #0284c750; }
+    .post { background: #16a34a20; color: #4ade80; border: 1px solid #16a34a50; }
+    .time { font-family: monospace; color: #94a3b8; font-size: 12px; }
+    .sn { font-family: monospace; font-weight: bold; color: #a78bfa; background: #a78bfa15; padding: 2px 6px; border-radius: 4px; }
+    .ip { font-family: monospace; color: #facc15; }
+    .url { font-family: monospace; word-break: break-all; color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <h1>
+    GymOpus ADMS Server — Live Packet Inspector
+    <span class="status">Auto-Refreshing (3s)</span>
+  </h1>
+  <p class="desc">Listening on Port 80 for eSSL / ZKTeco Biometric Machine (SN: NFZ8252804596). Total logged: ${recentLogs.length}</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Time (IST)</th>
+        <th>Method</th>
+        <th>Device SN</th>
+        <th>Client IP</th>
+        <th>Request URL</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${recentLogs.length === 0 ? '<tr><td colspan="5" style="text-align:center; padding: 30px; color: #64748b;">Waiting for device connection... Power ON the machine.</td></tr>' : ''}
+      ${recentLogs.map(l => `
+        <tr>
+          <td class="time">${l.ist}</td>
+          <td><span class="badge ${l.method.toLowerCase()}">${l.method}</span></td>
+          <td><span class="sn">${l.sn}</span></td>
+          <td class="ip">${l.ip}</td>
+          <td class="url">${l.url}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+</body>
+</html>`;
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(html);
+    return;
+  }
+
+  if (pathname === "/api/logs") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ logs: recentLogs }));
+    return;
+  }
+
+  // 7. Health Check
   if (pathname === "/" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
